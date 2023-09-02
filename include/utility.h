@@ -53,6 +53,7 @@
 #include <array>
 #include <thread>
 #include <mutex>
+#include <random>
 
 using namespace std;
 
@@ -112,6 +113,49 @@ public:
     Eigen::Matrix3d extRPY;
     Eigen::Vector3d extTrans;
     Eigen::Quaterniond extQRPY;
+
+    // IMU Noise Simulation
+    float accelNoiseDensity;
+    float accelRandomWalk;
+    float gyroNoiseDensity;
+    float gyroRandomWalk;
+    bool adjustIMUNoise;
+
+    std::random_device rd{};
+    std::mt19937 gen{rd()};
+    std::normal_distribution<double> unit_norm{0.0f, 1.0f};
+    
+    Eigen::Vector3d prev_accel_bias = Eigen::Vector3d::Zero();
+    Eigen::Vector3d prev_gyro_bias = Eigen::Vector3d::Zero();
+
+    // IMU Additive Gaussian Noise
+    Eigen::Vector3d sample_accel_noise(const double dt) {
+        Eigen::Vector3d noise;
+        noise << unit_norm(gen), unit_norm(gen), unit_norm(gen);
+        return accelNoiseDensity * noise / std::sqrt(dt);
+    }
+
+    Eigen::Vector3d sample_gyro_noise(const double dt) {
+        Eigen::Vector3d noise;
+        noise << unit_norm(gen), unit_norm(gen), unit_norm(gen);
+        return gyroNoiseDensity * noise / std::sqrt(dt);
+    }
+
+    // IMU Random Walk
+    Eigen::Vector3d sample_accel_bias(const double dt) {
+        Eigen::Vector3d noise;
+        noise << unit_norm(gen), unit_norm(gen), unit_norm(gen);
+        auto current_accel_bias = prev_accel_bias + accelRandomWalk * noise * std::sqrt(dt);
+        prev_accel_bias = current_accel_bias;
+        return current_accel_bias;
+    }
+    Eigen::Vector3d sample_gyro_bias(const double dt) {
+        Eigen::Vector3d noise;
+        noise << unit_norm(gen), unit_norm(gen), unit_norm(gen);
+        auto current_gyro_bias = prev_gyro_bias + gyroRandomWalk * noise * std::sqrt(dt);
+        prev_gyro_bias = current_gyro_bias;
+        return current_gyro_bias;
+    }
 
     // LOAM
     float edgeThreshold;
@@ -214,6 +258,20 @@ public:
         extTrans = Eigen::Map<const Eigen::Matrix<double, -1, -1, Eigen::RowMajor>>(extTransV.data(), 3, 1);
         extQRPY = Eigen::Quaterniond(extRPY).inverse();
 
+        // IMU noise injection
+        nh.param<float>("lio_sam/accelNoiseDensity", accelNoiseDensity, 0);
+        nh.param<float>("lio_sam/accelRandomWalk", accelRandomWalk, 0);
+        nh.param<float>("lio_sam/gyroNoiseDensity", gyroNoiseDensity, 0);
+        nh.param<float>("lio_sam/gyroRandomWalk", gyroRandomWalk, 0);
+        nh.param<bool>("lio_sam/adjustIMUNoise", adjustIMUNoise, false);
+
+        if (adjustIMUNoise) {
+            imuAccNoise += accelNoiseDensity;
+            imuGyrNoise += gyroNoiseDensity;
+            imuAccBiasN += accelRandomWalk;
+            imuGyrBiasN += gyroRandomWalk;
+        }
+
         nh.param<float>("lio_sam/edgeThreshold", edgeThreshold, 0.1);
         nh.param<float>("lio_sam/surfThreshold", surfThreshold, 0.1);
         nh.param<int>("lio_sam/edgeFeatureMinValidNum", edgeFeatureMinValidNum, 10);
@@ -249,21 +307,31 @@ public:
         usleep(100);
     }
 
-    sensor_msgs::Imu imuConverter(const sensor_msgs::Imu& imu_in)
+    sensor_msgs::Imu imuConverter(const sensor_msgs::Imu& imu_in, const double last_imu_time)
     {
         sensor_msgs::Imu imu_out = imu_in;
+
+        double current_imu_time = imu_in.header.stamp.toSec();
+        double dt = (last_imu_time < 0) ? (1.0 / 500.0) : (current_imu_time - last_imu_time);
+
         // rotate acceleration
         Eigen::Vector3d acc(imu_in.linear_acceleration.x, imu_in.linear_acceleration.y, imu_in.linear_acceleration.z);
+        acc += sample_accel_noise(dt) + sample_accel_bias(dt);
+
         acc = extRot * acc;
         imu_out.linear_acceleration.x = acc.x();
         imu_out.linear_acceleration.y = acc.y();
         imu_out.linear_acceleration.z = acc.z();
+
         // rotate gyroscope
         Eigen::Vector3d gyr(imu_in.angular_velocity.x, imu_in.angular_velocity.y, imu_in.angular_velocity.z);
+        gyr += sample_gyro_noise(dt) + sample_gyro_bias(dt);
+
         gyr = extRot * gyr;
         imu_out.angular_velocity.x = gyr.x();
         imu_out.angular_velocity.y = gyr.y();
         imu_out.angular_velocity.z = gyr.z();
+
         // rotate roll pitch yaw
         Eigen::Quaterniond q_from(imu_in.orientation.w, imu_in.orientation.x, imu_in.orientation.y, imu_in.orientation.z);
         Eigen::Quaterniond q_final = q_from * extQRPY;

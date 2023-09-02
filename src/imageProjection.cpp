@@ -86,6 +86,8 @@ private:
 
     vector<int> columnIdnCountVec;
 
+    double lastImuT_imu = -1;
+
 
 public:
     ImageProjection():
@@ -142,16 +144,21 @@ public:
         }
 
         columnIdnCountVec.assign(N_SCAN, 0);
+
+        lastImuT_imu = -1;
     }
 
     ~ImageProjection(){}
 
     void imuHandler(const sensor_msgs::Imu::ConstPtr& imuMsg)
     {
-        sensor_msgs::Imu thisImu = imuConverter(*imuMsg);
+        sensor_msgs::Imu thisImu = imuConverter(*imuMsg, lastImuT_imu);
 
         std::lock_guard<std::mutex> lock1(imuLock);
         imuQueue.push_back(thisImu);
+
+        double imuTime = ROS_TIME(&thisImu);
+        lastImuT_imu = imuTime;
 
         // debug IMU data
         // cout << std::setprecision(6);
